@@ -239,26 +239,33 @@ function Show-WorkspacePicker {
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox   = $false
 
+    $pickerFont = New-Object System.Drawing.Font('Segoe UI', 10)
+
     $lbl          = New-Object System.Windows.Forms.Label
     $lbl.Text     = "Select a workspace to browse reports:"
     $lbl.AutoSize = $true
+    $lbl.Font     = $pickerFont
     $lbl.Location = New-Object System.Drawing.Point(12, 12)
     $form.Controls.Add($lbl)
 
     $lblSearch          = New-Object System.Windows.Forms.Label
     $lblSearch.Text     = "Search:"
     $lblSearch.AutoSize = $true
-    $lblSearch.Location = New-Object System.Drawing.Point(12, 40)
+    $lblSearch.Font     = $pickerFont
+    $lblSearch.Location = New-Object System.Drawing.Point(12, 42)
     $form.Controls.Add($lblSearch)
 
     $txtSearch          = New-Object System.Windows.Forms.TextBox
-    $txtSearch.Location = New-Object System.Drawing.Point(70, 37)
-    $txtSearch.Size     = New-Object System.Drawing.Size(422, 23)
+    $txtSearch.Location = New-Object System.Drawing.Point(75, 40)
+    $txtSearch.Size     = New-Object System.Drawing.Size(417, 26)
+    $txtSearch.Font     = $pickerFont
     $form.Controls.Add($txtSearch)
 
     $listBox               = New-Object System.Windows.Forms.ListBox
-    $listBox.Location      = New-Object System.Drawing.Point(12, 70)
+    $listBox.Location      = New-Object System.Drawing.Point(12, 74)
     $listBox.Size          = New-Object System.Drawing.Size(480, 380)
+    $listBox.Font          = $pickerFont
+    $listBox.ItemHeight    = 24
     $listBox.SelectionMode = 'One'
     $listBox.Sorted        = $true
 
@@ -685,7 +692,7 @@ foreach ($reportId in $selectedReports.Keys) {
 Write-Host ""
 Write-Host "=========================================" 
 Write-Host "  Done.  Success: $successCount  |  Failed/Skipped: $failCount"
-Write-Host "  Output folder: $outputFolder"
+Write-Host "  Output folder: $outputFolder" -ForegroundColor Cyan
 Write-Host "=========================================" 
 
 # Cleanup
