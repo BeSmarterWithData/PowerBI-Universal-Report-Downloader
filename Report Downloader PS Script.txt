@@ -1,8 +1,8 @@
 # ============================================================
-# Download PBIR Script
+# Download Reports Script
 # Authenticates to Power BI, lets user pick workspace + reports,
 # then downloads each report's .pbir definition via the
-# Fabric "Get Item Definition" API.
+# Fabric "Get Item Definition" API. This includes Reports that cannot be downloaded in the service.
 # ============================================================
 
 $global:BaseFolderPath = "C:\Power BI Backups"
@@ -474,7 +474,7 @@ function Show-ReportPicker {
 # ================================================================
 
 Write-Output "========================================="
-Write-Output "  PBIR Download Tool"
+Write-Output "  Report Downloader Tool"
 Write-Output "========================================="
 
 # 1. Fetch workspaces
@@ -488,7 +488,6 @@ $workspaceName = $selectedWorkspace.Name
 Write-Host "[INFO] Selected workspace: $workspaceName ($workspaceId)" -ForegroundColor Cyan
 
 # 3. Fetch items via Fabric Items API (non-admin) to get correct item IDs
-Write-Host "[INFO] Fetching items from Fabric Items API..." -ForegroundColor DarkGray
 $fabricItemsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items?type=Report"
 $token = Get-CurrentAccessToken
 $fabricHeaders = @{ "Authorization" = "Bearer $token" }
@@ -505,7 +504,6 @@ while ($continuationUrl) {
     $continuationUrl = $itemsResponse.continuationUri
 }
 
-Write-Host "[INFO] Found $($allFabricReports.Count) report item(s) via Fabric Items API." -ForegroundColor Cyan
 
 if ($allFabricReports.Count -eq 0) {
     Write-Warning "No report items found in workspace '$workspaceName'."
@@ -513,9 +511,7 @@ if ($allFabricReports.Count -eq 0) {
 }
 
 # Show item details for diagnostics
-Write-Host "    Fabric Report Items:" -ForegroundColor DarkGray
 foreach ($item in $allFabricReports) {
-    Write-Host "      - $($item.displayName)  |  ItemId: $($item.id)  |  Type: $($item.type)" -ForegroundColor DarkGray
 }
 
 # Build array with 'name' and 'id' properties for the picker (using Fabric item IDs)
@@ -526,10 +522,9 @@ $reportsForPicker = $allFabricReports | ForEach-Object {
 # 4. Let user pick reports (multi-select)
 $selectedReports = Show-ReportPicker -Reports $reportsForPicker -WorkspaceName $workspaceName
 
-Write-Host "[INFO] $($selectedReports.Count) report(s) selected for download." -ForegroundColor Cyan
 
 # 5. Create output folder
-$outputFolder = Join-Path $baseFolderPath "PBIR Downloads\$workspaceName"
+$outputFolder = Join-Path $baseFolderPath "Report Downloads\$workspaceName"
 if (-not (Test-Path $outputFolder)) {
     New-Item -Path $outputFolder -ItemType Directory -Force | Out-Null
 }
@@ -547,7 +542,7 @@ foreach ($reportId in $selectedReports.Keys) {
     # Sanitise the report name for use as a file name
     $safeName = $reportName -replace '[\\/:*?"<>|]', '_'
 
-    Write-Host "  Downloading PBIR for: $reportName ..."
+    Write-Host "  Downloading $reportName ..."
 
     try {
         $definitionUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items/$reportId/getDefinition"
@@ -580,8 +575,6 @@ foreach ($reportId in $selectedReports.Keys) {
                 continue
             }
 
-            Write-Host "    Received 202 — Long Running Operation started (operation: $operationId)" -ForegroundColor DarkGray
-            Write-Host "    Polling status every ${retryAfter}s..." -ForegroundColor DarkGray
 
             $maxAttempts = 60
             $attempt = 0
@@ -595,13 +588,11 @@ foreach ($reportId in $selectedReports.Keys) {
                 try {
                     $statusResponse = Invoke-RestMethod -Uri $operationStatusUrl -Method GET -Headers $headers -ContentType "application/json"
                 } catch {
-                    Write-Host "    Poll attempt $attempt failed: $($_.Exception.Message)" -ForegroundColor Yellow
                     continue
                 }
 
                 $opStatus = $statusResponse.status
                 $opPercent = $statusResponse.percentComplete
-                Write-Host "    Poll $attempt — Status: $opStatus  ($opPercent% complete)" -ForegroundColor DarkGray
 
                 if ($opStatus -eq 'Succeeded') {
                     $operationSucceeded = $true
@@ -635,12 +626,10 @@ foreach ($reportId in $selectedReports.Keys) {
 
             # Step 2: Fetch the result from GET /v1/operations/{operationId}/result
             $resultUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/operations/$operationId/result"
-            Write-Host "    Operation succeeded — fetching result from $resultUrl" -ForegroundColor DarkGray
 
             try {
                 $webResponse = Invoke-WebRequest -Uri $resultUrl -Method GET -Headers $headers -UseBasicParsing
             } catch {
-                Write-Host "    FAILED to fetch operation result: $($_.Exception.Message)" -ForegroundColor Red
                 $failCount++
                 continue
             }
@@ -651,16 +640,11 @@ foreach ($reportId in $selectedReports.Keys) {
         # --- Diagnostic: show all parts returned ---
         $parts = $response.definition.parts
         if (-not $parts -or $parts.Count -eq 0) {
-            Write-Host "    WARNING: response contained no parts at all." -ForegroundColor Yellow
-            Write-Host "    Raw response (first 2000 chars):" -ForegroundColor DarkGray
-            Write-Host ("    " + $webResponse.Content.Substring(0, [Math]::Min(2000, $webResponse.Content.Length))) -ForegroundColor DarkGray
             $failCount++
             continue
         }
 
-        Write-Host "    Parts returned by API:" -ForegroundColor DarkGray
         foreach ($p in $parts) {
-            Write-Host "      - $($p.path)  (payloadType: $($p.payloadType))" -ForegroundColor DarkGray
         }
 
         # Save ALL parts into a subfolder named after the report
@@ -682,19 +666,15 @@ foreach ($reportId in $selectedReports.Keys) {
             [System.IO.File]::WriteAllBytes($partPath, $bytes)
         }
 
-        Write-Host "    Saved $($parts.Count) part(s) -> $reportFolder" -ForegroundColor Green
         $successCount++
     }
     catch {
-        Write-Host "    FAILED" -ForegroundColor Red
         Write-Warning "    Error for '$reportName': $($_.Exception.Message)"
         if ($_.Exception.Response) {
             try {
                 $errStream = $_.Exception.Response.GetResponseStream()
                 $reader = New-Object System.IO.StreamReader($errStream)
                 $errBody = $reader.ReadToEnd()
-                Write-Host "    API response body:" -ForegroundColor DarkGray
-                Write-Host "    $errBody" -ForegroundColor DarkGray
             } catch {}
         }
         $failCount++
