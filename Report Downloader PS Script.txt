@@ -1,0 +1,717 @@
+# ============================================================
+# Download PBIR Script
+# Authenticates to Power BI, lets user pick workspace + reports,
+# then downloads each report's .pbir definition via the
+# Fabric "Get Item Definition" API.
+# ============================================================
+
+$global:BaseFolderPath = "C:\Power BI Backups"
+$global:ConfigFolder   = Join-Path $global:BaseFolderPath "Config"
+
+$baseFolderPath = $global:BaseFolderPath
+$configFolder   = $global:ConfigFolder
+
+# Ensure Config exists
+if (-not (Test-Path $configFolder)) {
+    New-Item -Path $configFolder -ItemType Directory -Force | Out-Null
+}
+
+$global:TokenFilePath = Join-Path $configFolder "PowerBI_TempAccessToken.txt"
+
+$ErrorActionPreference = "SilentlyContinue"
+$WarningPreference     = "SilentlyContinue"
+
+# Temporarily set execution policy to Bypass for this session
+if ((Get-ExecutionPolicy) -ne 'Bypass') {
+    Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+}
+
+# Ensure required module is installed
+if (-not (Import-Module MicrosoftPowerBIMgmt -PassThru -EA Ignore)) {
+    Install-Module -Name MicrosoftPowerBIMgmt -Scope CurrentUser -Force
+}
+Import-Module MicrosoftPowerBIMgmt -ErrorAction Stop
+
+
+# ================================
+# Show Environment Selection Dialog
+# ================================
+function Show-EnvironmentSelectionDialog {
+    param(
+        [int]$TimeoutSeconds = 60
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text           = "Select Power BI Environment"
+    $form.StartPosition  = 'CenterScreen'
+    $form.Size           = New-Object System.Drawing.Size(400, 320)
+    $form.TopMost        = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox    = $false
+
+    $label          = New-Object System.Windows.Forms.Label
+    $label.Text     = "Select your Power BI cloud environment:"
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(20, 20)
+    $form.Controls.Add($label)
+
+    $listBox               = New-Object System.Windows.Forms.ListBox
+    $listBox.Location      = New-Object System.Drawing.Point(20, 50)
+    $listBox.Size          = New-Object System.Drawing.Size(340, 150)
+    $listBox.SelectionMode = 'One'
+
+    $environments = @(
+        'Public (Commercial)',
+        'Germany',
+        'USGov',
+        'China',
+        'USGovHigh',
+        'USGovMil'
+    )
+    foreach ($env in $environments) { [void]$listBox.Items.Add($env) }
+    $listBox.SelectedIndex = 0
+    $form.Controls.Add($listBox)
+
+    $timeoutLabel           = New-Object System.Windows.Forms.Label
+    $timeoutLabel.Text      = "Timeout in $TimeoutSeconds seconds (defaults to Public)"
+    $timeoutLabel.AutoSize  = $true
+    $timeoutLabel.Location  = New-Object System.Drawing.Point(20, 210)
+    $timeoutLabel.ForeColor = [System.Drawing.Color]::Gray
+    $form.Controls.Add($timeoutLabel)
+
+    $okButton          = New-Object System.Windows.Forms.Button
+    $okButton.Text     = "OK"
+    $okButton.Size     = New-Object System.Drawing.Size(75, 30)
+    $okButton.Location = New-Object System.Drawing.Point(205, 240)
+    $okButton.Add_Click({ $form.Tag = $listBox.SelectedItem; $form.Close() })
+    $form.Controls.Add($okButton)
+
+    $cancelButton          = New-Object System.Windows.Forms.Button
+    $cancelButton.Text     = "Cancel"
+    $cancelButton.Size     = New-Object System.Drawing.Size(75, 30)
+    $cancelButton.Location = New-Object System.Drawing.Point(285, 240)
+    $cancelButton.Add_Click({ $form.Tag = 'Cancelled'; $form.Close() })
+    $form.Controls.Add($cancelButton)
+
+    $timer          = New-Object System.Windows.Forms.Timer
+    $timer.Interval = $TimeoutSeconds * 1000
+    $timer.Add_Tick({ $timer.Stop(); $form.Tag = 'Timeout'; $form.Close() })
+
+    $form.Add_FormClosing({
+        param($sender, $e)
+        $timer.Stop(); $timer.Dispose()
+        if (-not $form.Tag) { $form.Tag = 'Cancelled' }
+    })
+
+    $listBox.Add_DoubleClick({ $form.Tag = $listBox.SelectedItem; $form.Close() })
+
+    $form.AcceptButton = $okButton
+    $form.CancelButton = $cancelButton
+    $timer.Start()
+    [void]$form.ShowDialog()
+
+    return $form.Tag
+}
+
+
+# ============================================
+# Prompt for Power BI Environment + Validation
+# ============================================
+if (-not (Get-Variable -Name LoginEnvironment -Scope Script -ErrorAction SilentlyContinue)) {
+
+    $selectedEnv = Show-EnvironmentSelectionDialog -TimeoutSeconds 60
+
+    if ($selectedEnv -eq 'Timeout' -or $selectedEnv -eq 'Cancelled' -or [string]::IsNullOrWhiteSpace($selectedEnv)) {
+        Write-Host "No environment selected or timeout reached - defaulting to Public" -ForegroundColor Yellow
+        $LoginEnvironment = 'Public'
+    }
+    else {
+        $envName = $selectedEnv -replace ' \(.*\)', ''
+        switch ($envName.Trim()) {
+            'Public'   { $LoginEnvironment = 'Public'   ; break }
+            'Germany'  { $LoginEnvironment = 'Germany'  ; break }
+            'USGovHigh'{ $LoginEnvironment = 'USGovHigh'; break }
+            'USGovMil' { $LoginEnvironment = 'USGovMil' ; break }
+            'USGov'    { $LoginEnvironment = 'USGov'    ; break }
+            'China'    { $LoginEnvironment = 'China'    ; break }
+            default    {
+                Write-Warning "Unrecognized environment '$selectedEnv'. Defaulting to 'Public'."
+                $LoginEnvironment = 'Public'
+            }
+        }
+        Write-Host "[INFO] Selected environment: $LoginEnvironment" -ForegroundColor Green
+    }
+}
+
+if ($LoginEnvironment -eq 'Public') { $LoginEnvironment = $null }
+
+
+# ================================
+# Environment-specific endpoints
+# ================================
+function Get-PowerBIEndpoints {
+    param([string]$Environment)
+
+    $endpoints = @{
+        ApiPrefix       = 'https://api.powerbi.com'
+        FabricApiPrefix = 'https://api.fabric.microsoft.com'
+    }
+
+    switch ($Environment) {
+        'Germany'  { $endpoints.ApiPrefix = 'https://api.powerbi.de';          $endpoints.FabricApiPrefix = 'https://api.fabric.microsoft.de' }
+        'China'    { $endpoints.ApiPrefix = 'https://api.powerbi.cn';          $endpoints.FabricApiPrefix = 'https://api.fabric.microsoft.cn' }
+        'USGov'    { $endpoints.ApiPrefix = 'https://api.powerbigov.us';       $endpoints.FabricApiPrefix = 'https://api.fabric.microsoft.us' }
+        'USGovHigh'{ $endpoints.ApiPrefix = 'https://api.high.powerbigov.us';  $endpoints.FabricApiPrefix = 'https://api.fabric.high.microsoft.us' }
+        'USGovMil' { $endpoints.ApiPrefix = 'https://api.mil.powerbi.us';      $endpoints.FabricApiPrefix = 'https://api.fabric.mil.microsoft.us' }
+    }
+
+    return $endpoints
+}
+
+$EnvironmentForEndpoints = if ($LoginEnvironment) { $LoginEnvironment } else { 'Public' }
+$global:PowerBIEndpoints = Get-PowerBIEndpoints -Environment $EnvironmentForEndpoints
+
+
+# ================================
+# Connect to Power BI
+# ================================
+function Connect-PowerBI {
+    param([string]$Environment)
+    if ($Environment) { Connect-PowerBIServiceAccount -Environment $Environment | Out-Null }
+    else              { Connect-PowerBIServiceAccount | Out-Null }
+
+    $global:accessTokenObject = Get-PowerBIAccessToken
+    $global:accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
+    Set-Content -Path $global:TokenFilePath -Value $global:accessToken
+}
+
+$scriptStartTime = Get-Date
+
+try   { Connect-PowerBI -Environment $LoginEnvironment -ErrorAction Stop | Out-Null }
+catch { Write-Host "[INFO] Connecting to Power BI using environment: $EnvironmentForEndpoints"; Connect-PowerBI -Environment $LoginEnvironment }
+
+
+# ================================
+# Token refresh background job
+# ================================
+function Start-TokenRefreshJob {
+    param([string]$Environment, [string]$BaseFolderPath)
+    $jobScript = {
+        param($EnvArg, $BaseFolderPathArg)
+        $tokenDir  = Join-Path $BaseFolderPathArg 'Config'
+        if (-not (Test-Path $tokenDir)) { New-Item -Path $tokenDir -ItemType Directory -Force | Out-Null }
+        $tokenFile = Join-Path $tokenDir 'PowerBI_TempAccessToken.txt'
+        function Connect-PowerBI { param([string]$Environment,[string]$TokenFilePath)
+            if ($Environment) { Connect-PowerBIServiceAccount -Environment $Environment | Out-Null } else { Connect-PowerBIServiceAccount | Out-Null }
+            $global:accessTokenObject = Get-PowerBIAccessToken; $global:accessToken = $accessTokenObject.Authorization -replace 'Bearer ',''
+            Set-Content -Path $TokenFilePath -Value $global:accessToken
+        }
+        while ($true) { Start-Sleep -Seconds 3300; Connect-PowerBI -Environment $EnvArg -TokenFilePath $tokenFile }
+    }
+    Start-Job -ScriptBlock $jobScript -Name "TokenRefreshJob" -ArgumentList $Environment, $BaseFolderPath | Out-Null
+}
+
+Start-TokenRefreshJob -Environment $LoginEnvironment -BaseFolderPath $global:BaseFolderPath
+
+function Get-CurrentAccessToken {
+    $global:accessToken = Get-Content -Path $global:TokenFilePath
+    return $global:accessToken
+}
+
+
+# ================================
+# Workspace Picker (same as main)
+# ================================
+function Show-WorkspacePicker {
+    param([Parameter(Mandatory)][array]$Workspaces)
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form               = New-Object System.Windows.Forms.Form
+    $form.Text          = "Select Workspace"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size          = New-Object System.Drawing.Size(520, 580)
+    $form.TopMost       = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox   = $false
+
+    $lbl          = New-Object System.Windows.Forms.Label
+    $lbl.Text     = "Select a workspace to browse reports:"
+    $lbl.AutoSize = $true
+    $lbl.Location = New-Object System.Drawing.Point(12, 12)
+    $form.Controls.Add($lbl)
+
+    $lblSearch          = New-Object System.Windows.Forms.Label
+    $lblSearch.Text     = "Search:"
+    $lblSearch.AutoSize = $true
+    $lblSearch.Location = New-Object System.Drawing.Point(12, 40)
+    $form.Controls.Add($lblSearch)
+
+    $txtSearch          = New-Object System.Windows.Forms.TextBox
+    $txtSearch.Location = New-Object System.Drawing.Point(70, 37)
+    $txtSearch.Size     = New-Object System.Drawing.Size(422, 23)
+    $form.Controls.Add($txtSearch)
+
+    $listBox               = New-Object System.Windows.Forms.ListBox
+    $listBox.Location      = New-Object System.Drawing.Point(12, 70)
+    $listBox.Size          = New-Object System.Drawing.Size(480, 380)
+    $listBox.SelectionMode = 'One'
+    $listBox.Sorted        = $true
+
+    $allItems = @()
+    foreach ($ws in $Workspaces) {
+        $display = "{0} ({1})" -f $ws.name, $ws.id
+        $allItems += [pscustomobject]@{ Display=$display; Id=$ws.id; Name=$ws.name }
+    }
+    foreach ($item in $allItems) { [void]$listBox.Items.Add($item) }
+    $listBox.DisplayMember = 'Display'
+    $form.Controls.Add($listBox)
+
+    $txtSearch.Add_TextChanged({
+        $search = $txtSearch.Text
+        $listBox.BeginUpdate(); $listBox.Items.Clear()
+        $escaped = [regex]::Escape($search)
+        foreach ($item in $allItems) {
+            if ([string]::IsNullOrWhiteSpace($search) -or $item.Display -imatch $escaped) {
+                [void]$listBox.Items.Add($item)
+            }
+        }
+        $listBox.EndUpdate()
+    })
+
+    $okBtn          = New-Object System.Windows.Forms.Button
+    $okBtn.Text     = "OK"
+    $okBtn.Width    = 100
+    $okBtn.Location = New-Object System.Drawing.Point(286, 500)
+    $okBtn.Add_Click({
+        if ($listBox.SelectedItem) { $form.Tag = $listBox.SelectedItem; $form.Close() }
+        else { [System.Windows.Forms.MessageBox]::Show("Please select a workspace.", "No Selection") }
+    })
+    $form.Controls.Add($okBtn)
+
+    $cancelBtn          = New-Object System.Windows.Forms.Button
+    $cancelBtn.Text     = "Cancel"
+    $cancelBtn.Width    = 100
+    $cancelBtn.Location = New-Object System.Drawing.Point(392, 500)
+    $cancelBtn.Add_Click({ $form.Tag = 'Cancel'; $form.Close() })
+    $form.Controls.Add($cancelBtn)
+
+    $listBox.Add_DoubleClick({
+        if ($listBox.SelectedItem) { $form.Tag = $listBox.SelectedItem; $form.Close() }
+    })
+
+    # Timer (auto-close after 10 minutes)
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 600000
+    $timer.Add_Tick({
+        $timer.Stop()
+        $form.Tag = 'Cancel'
+        $form.Close()
+    })
+
+    $form.Add_FormClosing({
+        param($sender, $e)
+        $timer.Stop(); $timer.Dispose()
+        if (-not $form.Tag) { $form.Tag = 'Cancel' }
+    })
+
+    $form.AcceptButton = $okBtn
+    $form.CancelButton = $cancelBtn
+    $timer.Start()
+    [void]$form.ShowDialog()
+
+    if ($form.Tag -eq 'Cancel' -or -not $form.Tag) { throw "User cancelled workspace selection." }
+    return $form.Tag
+}
+
+
+# ================================
+# Report Picker (multi-select)
+# ================================
+function Show-ReportPicker {
+    param(
+        [Parameter(Mandatory)][array]$Reports,
+        [string]$WorkspaceName
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form               = New-Object System.Windows.Forms.Form
+    $form.Text          = "Select Reports – $WorkspaceName"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size          = New-Object System.Drawing.Size(520, 580)
+    $form.TopMost       = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox   = $false
+
+    $lbl          = New-Object System.Windows.Forms.Label
+    $lbl.Text     = "Select reports to download as PBIR:"
+    $lbl.AutoSize = $true
+    $lbl.Location = New-Object System.Drawing.Point(12, 12)
+    $form.Controls.Add($lbl)
+
+    $lblSearch          = New-Object System.Windows.Forms.Label
+    $lblSearch.Text     = "Search:"
+    $lblSearch.AutoSize = $true
+    $lblSearch.Location = New-Object System.Drawing.Point(12, 40)
+    $form.Controls.Add($lblSearch)
+
+    $txtSearch          = New-Object System.Windows.Forms.TextBox
+    $txtSearch.Location = New-Object System.Drawing.Point(70, 37)
+    $txtSearch.Size     = New-Object System.Drawing.Size(422, 23)
+    $form.Controls.Add($txtSearch)
+
+    $clb              = New-Object System.Windows.Forms.CheckedListBox
+    $clb.Location     = New-Object System.Drawing.Point(12, 70)
+    $clb.Size         = New-Object System.Drawing.Size(480, 380)
+    $clb.CheckOnClick = $true
+    $clb.Sorted       = $true
+
+    $allReportItems = @()
+    foreach ($r in $Reports) {
+        $display = "{0}  [{1}]" -f $r.name, $r.id
+        $allReportItems += [pscustomobject]@{ Display=$display; Id=$r.id; Name=$r.name }
+    }
+
+    $persistentCheckedIds = @{}
+
+    foreach ($item in $allReportItems) { [void]$clb.Items.Add($item) }
+    $clb.DisplayMember = 'Display'
+    $form.Controls.Add($clb)
+
+    $clb.Add_ItemCheck({
+        param($sender, $e)
+        $item = $clb.Items[$e.Index]
+        if ($e.NewValue -eq 'Checked')   { $persistentCheckedIds[$item.Id] = $item.Name }
+        elseif ($e.NewValue -eq 'Unchecked') { $persistentCheckedIds.Remove($item.Id) }
+    })
+
+    $txtSearch.Add_TextChanged({
+        $search = $txtSearch.Text
+        $clb.BeginUpdate(); $clb.Items.Clear()
+        $escaped = [regex]::Escape($search)
+        foreach ($item in $allReportItems) {
+            if ([string]::IsNullOrWhiteSpace($search) -or $item.Display -imatch $escaped) {
+                $idx = $clb.Items.Add($item)
+                if ($persistentCheckedIds.ContainsKey($item.Id)) { $clb.SetItemChecked($idx, $true) }
+            }
+        }
+        $clb.EndUpdate()
+    })
+
+    # Select All / Clear All
+    $chkAll          = New-Object System.Windows.Forms.CheckBox
+    $chkAll.Text     = "Select All"
+    $chkAll.AutoSize = $true
+    $chkAll.Location = New-Object System.Drawing.Point(12, 460)
+    $chkAll.Add_CheckedChanged({
+        for ($i = 0; $i -lt $clb.Items.Count; $i++) { $clb.SetItemChecked($i, $chkAll.Checked) }
+    })
+    $form.Controls.Add($chkAll)
+
+    $btnClear          = New-Object System.Windows.Forms.Button
+    $btnClear.Text     = "Clear All"
+    $btnClear.Width    = 80
+    $btnClear.Location = New-Object System.Drawing.Point(90, 458)
+    $btnClear.Add_Click({
+        for ($i = 0; $i -lt $clb.Items.Count; $i++) { $clb.SetItemChecked($i, $false) }
+        $chkAll.Checked = $false
+    })
+    $form.Controls.Add($btnClear)
+
+    $okBtn          = New-Object System.Windows.Forms.Button
+    $okBtn.Text     = "OK"
+    $okBtn.Width    = 100
+    $okBtn.Location = New-Object System.Drawing.Point(286, 500)
+    $okBtn.Add_Click({
+        if ($persistentCheckedIds.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Please select at least one report.", "No Selection")
+        } else { $form.Tag = 'OK'; $form.Close() }
+    })
+    $form.Controls.Add($okBtn)
+
+    $cancelBtn          = New-Object System.Windows.Forms.Button
+    $cancelBtn.Text     = "Cancel"
+    $cancelBtn.Width    = 100
+    $cancelBtn.Location = New-Object System.Drawing.Point(392, 500)
+    $cancelBtn.Add_Click({ $form.Tag = 'Cancel'; $form.Close() })
+    $form.Controls.Add($cancelBtn)
+
+    # Timer (auto-close after 10 minutes)
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 600000
+    $timer.Add_Tick({
+        $timer.Stop()
+        $form.Tag = 'Cancel'
+        $form.Close()
+    })
+
+    $form.Add_FormClosing({
+        param($sender, $e)
+        $timer.Stop(); $timer.Dispose()
+        if (-not $form.Tag) { $form.Tag = 'Cancel' }
+    })
+
+    $form.AcceptButton = $okBtn
+    $form.CancelButton = $cancelBtn
+    $timer.Start()
+    [void]$form.ShowDialog()
+
+    if ($form.Tag -eq 'Cancel' -or -not $form.Tag) { throw "User cancelled report selection." }
+
+    # Return hashtable of Id -> Name
+    return $persistentCheckedIds.Clone()
+}
+
+
+# ================================================================
+#  MAIN FLOW
+# ================================================================
+
+Write-Output "========================================="
+Write-Output "  PBIR Download Tool"
+Write-Output "========================================="
+
+# 1. Fetch workspaces
+$workspacesUrl      = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups"
+$workspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $workspacesUrl | ConvertFrom-Json
+
+# 2. Let user pick a workspace (single-select)
+$selectedWorkspace = Show-WorkspacePicker -Workspaces $workspacesResponse.value
+$workspaceId   = $selectedWorkspace.Id
+$workspaceName = $selectedWorkspace.Name
+Write-Host "[INFO] Selected workspace: $workspaceName ($workspaceId)" -ForegroundColor Cyan
+
+# 3. Fetch items via Fabric Items API (non-admin) to get correct item IDs
+Write-Host "[INFO] Fetching items from Fabric Items API..." -ForegroundColor DarkGray
+$fabricItemsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items?type=Report"
+$token = Get-CurrentAccessToken
+$fabricHeaders = @{ "Authorization" = "Bearer $token" }
+
+$allFabricReports = @()
+$continuationUrl  = $fabricItemsUrl
+
+# Handle pagination (continuationToken / continuationUri)
+while ($continuationUrl) {
+    $itemsResponse = Invoke-RestMethod -Uri $continuationUrl -Method GET -Headers $fabricHeaders -ContentType "application/json"
+    if ($itemsResponse.value) {
+        $allFabricReports += $itemsResponse.value
+    }
+    $continuationUrl = $itemsResponse.continuationUri
+}
+
+Write-Host "[INFO] Found $($allFabricReports.Count) report item(s) via Fabric Items API." -ForegroundColor Cyan
+
+if ($allFabricReports.Count -eq 0) {
+    Write-Warning "No report items found in workspace '$workspaceName'."
+    exit
+}
+
+# Show item details for diagnostics
+Write-Host "    Fabric Report Items:" -ForegroundColor DarkGray
+foreach ($item in $allFabricReports) {
+    Write-Host "      - $($item.displayName)  |  ItemId: $($item.id)  |  Type: $($item.type)" -ForegroundColor DarkGray
+}
+
+# Build array with 'name' and 'id' properties for the picker (using Fabric item IDs)
+$reportsForPicker = $allFabricReports | ForEach-Object {
+    [pscustomobject]@{ name = $_.displayName; id = $_.id }
+}
+
+# 4. Let user pick reports (multi-select)
+$selectedReports = Show-ReportPicker -Reports $reportsForPicker -WorkspaceName $workspaceName
+
+Write-Host "[INFO] $($selectedReports.Count) report(s) selected for download." -ForegroundColor Cyan
+
+# 5. Create output folder
+$outputFolder = Join-Path $baseFolderPath "PBIR Downloads\$workspaceName"
+if (-not (Test-Path $outputFolder)) {
+    New-Item -Path $outputFolder -ItemType Directory -Force | Out-Null
+}
+
+# 6. Download each report's PBIR via Get Item Definition API
+$token = Get-CurrentAccessToken
+$headers = @{ "Authorization" = "Bearer $token" }
+
+$successCount = 0
+$failCount    = 0
+
+foreach ($reportId in $selectedReports.Keys) {
+
+    $reportName = $selectedReports[$reportId]
+    # Sanitise the report name for use as a file name
+    $safeName = $reportName -replace '[\\/:*?"<>|]', '_'
+
+    Write-Host "  Downloading PBIR for: $reportName ..."
+
+    try {
+        $definitionUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items/$reportId/getDefinition"
+
+        # Use Invoke-WebRequest so we can inspect status codes (202 = long-running operation)
+        $webResponse = Invoke-WebRequest -Uri $definitionUrl -Method POST -Headers $headers -ContentType "application/json" -UseBasicParsing
+
+        # Handle 202 Accepted — Fabric Long Running Operation (LRO) pattern
+        # Ref: https://learn.microsoft.com/en-us/rest/api/fabric/articles/long-running-operation
+        if ($webResponse.StatusCode -eq 202) {
+            $retryAfter  = 5
+            $operationId = $webResponse.Headers['x-ms-operation-id']
+            $locationUrl = $webResponse.Headers['Location']
+
+            if ($webResponse.Headers['Retry-After']) {
+                $retryAfter = [int]$webResponse.Headers['Retry-After']
+            }
+
+            # Determine the operation status polling URL
+            # Prefer Location header; fall back to constructing from operation ID
+            $operationStatusUrl = if ($locationUrl) {
+                $locationUrl
+            } elseif ($operationId) {
+                "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/operations/$operationId"
+            } else { $null }
+
+            if (-not $operationStatusUrl) {
+                Write-Warning "    No Location or x-ms-operation-id header in 202 response. Cannot poll."
+                $failCount++
+                continue
+            }
+
+            Write-Host "    Received 202 — Long Running Operation started (operation: $operationId)" -ForegroundColor DarkGray
+            Write-Host "    Polling status every ${retryAfter}s..." -ForegroundColor DarkGray
+
+            $maxAttempts = 60
+            $attempt = 0
+            $operationSucceeded = $false
+
+            # Step 1: Poll GET /v1/operations/{operationId} until status = Succeeded/Failed
+            while ($attempt -lt $maxAttempts) {
+                Start-Sleep -Seconds $retryAfter
+                $attempt++
+
+                try {
+                    $statusResponse = Invoke-RestMethod -Uri $operationStatusUrl -Method GET -Headers $headers -ContentType "application/json"
+                } catch {
+                    Write-Host "    Poll attempt $attempt failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                    continue
+                }
+
+                $opStatus = $statusResponse.status
+                $opPercent = $statusResponse.percentComplete
+                Write-Host "    Poll $attempt — Status: $opStatus  ($opPercent% complete)" -ForegroundColor DarkGray
+
+                if ($opStatus -eq 'Succeeded') {
+                    $operationSucceeded = $true
+                    break
+                }
+                elseif ($opStatus -eq 'Failed') {
+                    $errCode = $statusResponse.error.errorCode
+                    $errMsg  = $statusResponse.error.message
+                    Write-Host "    Operation FAILED: [$errCode] $errMsg" -ForegroundColor Red
+                    break
+                }
+                elseif ($opStatus -eq 'Undefined') {
+                    Write-Host "    Operation returned 'Undefined' status — aborting." -ForegroundColor Red
+                    break
+                }
+                # else: Running / NotStarted — keep polling
+
+                # Honour updated Retry-After if present in the response
+                if ($statusResponse.'Retry-After') {
+                    $retryAfter = [int]$statusResponse.'Retry-After'
+                }
+            }
+
+            if (-not $operationSucceeded) {
+                if ($attempt -ge $maxAttempts) {
+                    Write-Host "    TIMED OUT after $maxAttempts poll attempts." -ForegroundColor Yellow
+                }
+                $failCount++
+                continue
+            }
+
+            # Step 2: Fetch the result from GET /v1/operations/{operationId}/result
+            $resultUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/operations/$operationId/result"
+            Write-Host "    Operation succeeded — fetching result from $resultUrl" -ForegroundColor DarkGray
+
+            try {
+                $webResponse = Invoke-WebRequest -Uri $resultUrl -Method GET -Headers $headers -UseBasicParsing
+            } catch {
+                Write-Host "    FAILED to fetch operation result: $($_.Exception.Message)" -ForegroundColor Red
+                $failCount++
+                continue
+            }
+        }
+
+        $response = $webResponse.Content | ConvertFrom-Json
+
+        # --- Diagnostic: show all parts returned ---
+        $parts = $response.definition.parts
+        if (-not $parts -or $parts.Count -eq 0) {
+            Write-Host "    WARNING: response contained no parts at all." -ForegroundColor Yellow
+            Write-Host "    Raw response (first 2000 chars):" -ForegroundColor DarkGray
+            Write-Host ("    " + $webResponse.Content.Substring(0, [Math]::Min(2000, $webResponse.Content.Length))) -ForegroundColor DarkGray
+            $failCount++
+            continue
+        }
+
+        Write-Host "    Parts returned by API:" -ForegroundColor DarkGray
+        foreach ($p in $parts) {
+            Write-Host "      - $($p.path)  (payloadType: $($p.payloadType))" -ForegroundColor DarkGray
+        }
+
+        # Save ALL parts into a subfolder named after the report
+        $reportFolder = Join-Path $outputFolder $safeName
+        if (-not (Test-Path $reportFolder)) {
+            New-Item -Path $reportFolder -ItemType Directory -Force | Out-Null
+        }
+
+        foreach ($part in $parts) {
+            $partPath = Join-Path $reportFolder $part.path
+
+            # Create subdirectories if the part path contains folders (e.g. "StaticResources/...")
+            $partDir = Split-Path $partPath -Parent
+            if (-not (Test-Path $partDir)) {
+                New-Item -Path $partDir -ItemType Directory -Force | Out-Null
+            }
+
+            $bytes = [System.Convert]::FromBase64String($part.payload)
+            [System.IO.File]::WriteAllBytes($partPath, $bytes)
+        }
+
+        Write-Host "    Saved $($parts.Count) part(s) -> $reportFolder" -ForegroundColor Green
+        $successCount++
+    }
+    catch {
+        Write-Host "    FAILED" -ForegroundColor Red
+        Write-Warning "    Error for '$reportName': $($_.Exception.Message)"
+        if ($_.Exception.Response) {
+            try {
+                $errStream = $_.Exception.Response.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($errStream)
+                $errBody = $reader.ReadToEnd()
+                Write-Host "    API response body:" -ForegroundColor DarkGray
+                Write-Host "    $errBody" -ForegroundColor DarkGray
+            } catch {}
+        }
+        $failCount++
+    }
+}
+
+# 7. Summary
+Write-Host ""
+Write-Host "=========================================" 
+Write-Host "  Done.  Success: $successCount  |  Failed/Skipped: $failCount"
+Write-Host "  Output folder: $outputFolder"
+Write-Host "=========================================" 
+
+# Cleanup
+Stop-Job -Name "TokenRefreshJob" -ErrorAction SilentlyContinue
+Remove-Job -Name "TokenRefreshJob" -ErrorAction SilentlyContinue
+if (Test-Path $global:TokenFilePath) { Remove-Item $global:TokenFilePath -Force -ErrorAction SilentlyContinue }
+
+$elapsed = New-TimeSpan -Start $scriptStartTime -End (Get-Date)
+Write-Output "Total Elapsed Time: $($elapsed.Hours)h $($elapsed.Minutes)m $($elapsed.Seconds)s"
