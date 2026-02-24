@@ -1,7 +1,7 @@
 # ============================================================
 # Download Reports Script
 # Authenticates to Power BI, lets user pick workspace + reports,
-# then downloads each report's .pbir definition via the
+# then downloads each report's definition via the
 # Fabric "Get Item Definition" API. This includes Reports that cannot be downloaded in the service.
 # ============================================================
 
@@ -357,7 +357,7 @@ function Show-ReportPicker {
     $form.MaximizeBox   = $false
 
     $lbl          = New-Object System.Windows.Forms.Label
-    $lbl.Text     = "Select reports to download as PBIR:"
+    $lbl.Text     = "Select reports to download:"
     $lbl.AutoSize = $true
     $lbl.Location = New-Object System.Drawing.Point(12, 12)
     $form.Controls.Add($lbl)
@@ -536,7 +536,7 @@ if (-not (Test-Path $outputFolder)) {
     New-Item -Path $outputFolder -ItemType Directory -Force | Out-Null
 }
 
-# 6. Download each report's PBIR via Get Item Definition API
+# 6. Download each report via Get Item Definition API
 $token = Get-CurrentAccessToken
 $headers = @{ "Authorization" = "Bearer $token" }
 
