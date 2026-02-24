@@ -4,6 +4,13 @@ A lightweight tool that downloads Power BI reports from any workspace using the 
 
 **Works on any report** — including legacy format reports and PBIR reports. Most importantly, this tool can download reports that are **unable to be downloaded directly from the Power BI service**.
 
+## 🚀 Quick Start Instructions  
+
+### 🟢 One-Click Update & Run Tool
+Always up-to-date and the easiest way to get started.  
+
+➡️ [**Download One-Click Update & Run Tool**](https://github.com/BeSmarterWithData/PowerBI-Universal-Report-Downloader/releases/download/1.0/PowerBIReportDownloader.bat)
+
 ## How It Works
 
 1. **Run `Universal Power BI Downloader.bat`** — downloads the latest version of this repo and executes the downloader script inline.
