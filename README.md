@@ -42,3 +42,14 @@ Once downloaded, you can:
 ## Quick Start
 
 Double-click **`Universal Power BI Downloader.bat`** and follow the prompts.
+
+Same file to open and re-save when complete no matter which format the report is in:
+
+
+Legacy format:
+
+<img width="1336" height="422" alt="image" src="https://github.com/user-attachments/assets/bca4ca41-b545-4aea-9933-dd0f36fbec00" />
+
+PBIR Format:
+
+<img width="1193" height="362" alt="image" src="https://github.com/user-attachments/assets/edfe16ae-5264-4da1-8502-a1bcd3b66e70" />
