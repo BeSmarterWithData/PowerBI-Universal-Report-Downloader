@@ -12,6 +12,9 @@ A lightweight tool that downloads Power BI reports from any workspace using the 
 4. **Pick a workspace**, then **select one or more reports** to download.
 5. Reports are saved to `C:\Power BI Backups` in PBIR / Project structure format.
 
+<img width="311" height="351" alt="2" src="https://github.com/user-attachments/assets/e4b1d514-67d5-45af-8763-9191124ae1fe" /> <img width="310" height="353" alt="1" src="https://github.com/user-attachments/assets/15f01326-5638-4d96-8e2e-e9fdcbf3da5c" />
+
+
 ## Auto-Update
 
 Every time you run **`Universal Power BI Downloader.bat`**, it automatically pulls the latest version of the script from this repository. There is no need to manually download updates — just keep using the same `.bat` file and you'll always be on the newest version.
