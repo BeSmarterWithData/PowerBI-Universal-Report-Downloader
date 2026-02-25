@@ -27,8 +27,29 @@ if ((Get-ExecutionPolicy) -ne 'Bypass') {
 }
 
 # Ensure required module is installed
-if (-not (Import-Module MicrosoftPowerBIMgmt -PassThru -EA Ignore)) {
-    Install-Module -Name MicrosoftPowerBIMgmt -Scope CurrentUser -Force
+# Force TLS 1.2 (required for PSGallery on older systems)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Ensure NuGet provider is available (non-admin, current user)
+if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue |
+          Where-Object { $_.Version -ge [version]'2.8.5.201' })) {
+    Write-Host "[INFO] Installing NuGet package provider..." -ForegroundColor Yellow
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
+}
+
+# Update PowerShellGet if stuck on 1.0.0.1 (fixes authenticode signature errors)
+$psGetVer = (Get-Module PowerShellGet -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1).Version
+if ($psGetVer -lt [version]'2.0.0') {
+    Write-Host "[INFO] Updating PowerShellGet to fix signature validation..." -ForegroundColor Yellow
+    Install-Module -Name PowerShellGet -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck
+    # Re-import the updated module
+    Remove-Module PowerShellGet -Force -ErrorAction SilentlyContinue
+    Import-Module PowerShellGet -Force
+}
+
+if (-not (Get-Module MicrosoftPowerBIMgmt -ListAvailable)) {
+    Write-Host "[INFO] Installing MicrosoftPowerBIMgmt module..." -ForegroundColor Yellow
+    Install-Module -Name MicrosoftPowerBIMgmt -Scope CurrentUser -Force -SkipPublisherCheck
 }
 Import-Module MicrosoftPowerBIMgmt -ErrorAction Stop
 
