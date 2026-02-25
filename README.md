@@ -4,7 +4,7 @@ A lightweight tool that downloads Power BI reports from any workspace using the 
 
 **Works on any report** — including legacy format reports and PBIR reports. Most importantly, this tool can download reports that are **unable to be downloaded directly from the Power BI service**.
 
-## 🚀 Quick Start Instructions  
+## Quick Start Instructions  
 
 ### 🟢 One-Click Update & Run Tool
 Always up-to-date and the easiest way to get started.  
